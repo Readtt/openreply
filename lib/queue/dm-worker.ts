@@ -26,6 +26,7 @@ import {
   sendPrivateReplyWithLinkButton,
 } from "@/lib/meta/client";
 import { decryptToken } from "@/lib/meta/oauth";
+import { attachPendingNextMedia } from "@/lib/polling/attach-next-media";
 import { matchKeywords } from "@/lib/utils/keyword-matcher";
 import { reserveDMSlot } from "@/lib/utils/rate-limiter";
 import {
@@ -188,24 +189,19 @@ async function sendRevealDirectMessage(
   }
 }
 
-async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
-  const {
-    instagramAccountId,
-    commentId,
-    commentText,
-    commenterId,
-    commenterName,
-    mediaId,
-    originalMediaId,
-  } = job.data;
-  const requeueAttempt = job.data.requeueAttempt ?? 0;
-
-  const automations = await prisma.automation.findMany({
+/**
+ * Campaigns that cover the media a comment was left on: the ones bound to that
+ * post, plus any-post campaigns. A comment left on an ad carries the ad's own
+ * media id while the campaign is bound to the post the ad was created from, so
+ * both ids have to be considered or the comment is dropped without a trace.
+ */
+function findCommentAutomations(
+  instagramAccountId: string,
+  mediaId: string,
+  originalMediaId?: string
+) {
+  return prisma.automation.findMany({
     where: {
-      // Match campaigns bound to this specific post, plus any-post campaigns.
-      // A comment left on an ad carries the ad's own media id, while the
-      // campaign is bound to the post the ad was created from, so both ids
-      // have to be considered or the comment is dropped without a trace.
       OR: [
         { postId: mediaId },
         ...(originalMediaId ? [{ postId: originalMediaId }] : []),
@@ -230,6 +226,80 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
     },
     orderBy: { createdAt: "asc" },
   });
+}
+
+// A "next post or reel" campaign has no postId until it is bound to the post the
+// creator published, and until then it matches nothing — the reel's first
+// comments get no DM and no public reply. The poll loop binds within its
+// interval; this closes the rest of the gap by binding the moment a comment
+// arrives for an account with a campaign still waiting. Throttled per account so
+// a burst of comments on an unrelated post cannot turn into a burst of media
+// calls (Instagram rate-limits those hard).
+const PENDING_BIND_THROTTLE_MS = 60_000;
+const lastPendingBindAt = new Map<string, number>();
+
+async function bindPendingNextMedia(
+  instagramAccountId: string
+): Promise<boolean> {
+  const last = lastPendingBindAt.get(instagramAccountId) ?? 0;
+  if (Date.now() - last < PENDING_BIND_THROTTLE_MS) return false;
+  lastPendingBindAt.set(instagramAccountId, Date.now());
+
+  const waiting = await prisma.automation.count({
+    where: {
+      pendingNextReel: true,
+      isActive: true,
+      instagramAccount: { instagramId: instagramAccountId },
+    },
+  });
+  if (waiting === 0) return false;
+
+  try {
+    const { bound } = await attachPendingNextMedia({
+      instagramId: instagramAccountId,
+    });
+    return bound > 0;
+  } catch (error) {
+    console.error(
+      "[DM Worker] Binding a campaign to the new post failed:",
+      formatError(error)
+    );
+    return false;
+  }
+}
+
+async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
+  const {
+    instagramAccountId,
+    commentId,
+    commentText,
+    commenterId,
+    commenterName,
+    mediaId,
+    originalMediaId,
+  } = job.data;
+  const requeueAttempt = job.data.requeueAttempt ?? 0;
+
+  let automations = await findCommentAutomations(
+    instagramAccountId,
+    mediaId,
+    originalMediaId
+  );
+
+  // Nothing covers this comment yet — but a campaign waiting on the creator's
+  // next post would, once it is bound to the post that just went up. Bind now
+  // and look again, so the first comment on a fresh reel is answered instead of
+  // waiting for the next sweep.
+  if (
+    automations.length === 0 &&
+    (await bindPendingNextMedia(instagramAccountId))
+  ) {
+    automations = await findCommentAutomations(
+      instagramAccountId,
+      mediaId,
+      originalMediaId
+    );
+  }
 
   for (const automation of automations) {
     // "Any word" campaigns fire on every comment; otherwise require a keyword hit.

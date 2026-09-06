@@ -15,11 +15,13 @@ const {
   mockQueueAdd,
   mockReserveWorkspaceDMSend,
   mockReleaseWorkspaceDMReservation,
+  mockAttachPendingNextMedia,
 } = vi.hoisted(() => ({
   mockPrisma: {
     automation: {
       findMany: vi.fn(),
       findFirst: vi.fn(),
+      count: vi.fn(),
     },
     dmLog: {
       findUnique: vi.fn(),
@@ -48,6 +50,7 @@ const {
   mockQueueAdd: vi.fn(),
   mockReserveWorkspaceDMSend: vi.fn(),
   mockReleaseWorkspaceDMReservation: vi.fn(),
+  mockAttachPendingNextMedia: vi.fn(),
 }));
 
 vi.mock("@/lib/db/client", () => ({
@@ -86,6 +89,10 @@ vi.mock("@/lib/meta/client", () => ({
 
 vi.mock("@/lib/meta/oauth", () => ({
   decryptToken: mockDecryptToken,
+}));
+
+vi.mock("@/lib/polling/attach-next-media", () => ({
+  attachPendingNextMedia: mockAttachPendingNextMedia,
 }));
 
 vi.mock("@/lib/utils/keyword-matcher", () => ({
@@ -213,6 +220,13 @@ beforeEach(() => {
 
   mockPrisma.automation.findMany.mockResolvedValue([mockAutomation]);
   mockPrisma.automation.findFirst.mockResolvedValue(null);
+  // No campaign is waiting on the creator's next post unless a test says so.
+  mockPrisma.automation.count.mockResolvedValue(0);
+  mockAttachPendingNextMedia.mockResolvedValue({
+    checked: 0,
+    bound: 0,
+    failedAccounts: 0,
+  });
   mockPrisma.dmLog.findUnique.mockResolvedValue(null);
   mockPrisma.dmLog.create.mockResolvedValue({});
   // Two different lookups share findFirst: the cross-campaign private-reply
@@ -365,6 +379,60 @@ describe("DM Worker — Full Pipeline", () => {
 
     expect(mockSendPrivateReply).not.toHaveBeenCalled();
     expect(mockPrisma.dmLog.upsert).not.toHaveBeenCalled();
+  });
+
+  // A "next post or reel" campaign has no postId until it is bound to the post
+  // the creator publishes, so its reel's first comments match nothing. Binding
+  // on the spot is what stops them being dropped with no DM and no reply.
+  it("binds a campaign waiting on the next post, then answers the comment", async () => {
+    const account = { ...mockAutomation.instagramAccount, instagramId: "ig_pending_1" };
+    const bound = { ...mockAutomation, postId: "media_new", instagramAccount: account };
+    mockPrisma.automation.findMany
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([bound]);
+    mockPrisma.automation.count.mockResolvedValue(1);
+    mockAttachPendingNextMedia.mockResolvedValue({
+      checked: 1,
+      bound: 1,
+      failedAccounts: 0,
+    });
+    const processor = getProcessor();
+
+    await processor(
+      createMockJob({
+        ...mockJobData,
+        instagramAccountId: "ig_pending_1",
+        mediaId: "media_new",
+      })
+    );
+
+    expect(mockAttachPendingNextMedia).toHaveBeenCalledWith({
+      instagramId: "ig_pending_1",
+    });
+    expect(mockSendPrivateReply).toHaveBeenCalled();
+  });
+
+  it("does not go looking for a new post when nothing is waiting on one", async () => {
+    mockPrisma.automation.findMany.mockResolvedValue([]);
+    mockPrisma.automation.count.mockResolvedValue(0);
+    const processor = getProcessor();
+
+    await processor(
+      createMockJob({ ...mockJobData, instagramAccountId: "ig_pending_2" })
+    );
+
+    expect(mockAttachPendingNextMedia).not.toHaveBeenCalled();
+  });
+
+  it("leaves a matched comment alone instead of re-checking for a new post", async () => {
+    const processor = getProcessor();
+
+    await processor(
+      createMockJob({ ...mockJobData, instagramAccountId: "ig_pending_3" })
+    );
+
+    expect(mockPrisma.automation.count).not.toHaveBeenCalled();
+    expect(mockAttachPendingNextMedia).not.toHaveBeenCalled();
   });
 
   it("should skip when keywords do not match", async () => {
