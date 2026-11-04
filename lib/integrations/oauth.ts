@@ -3,7 +3,7 @@ import { z } from "zod";
 import { prisma } from "@/lib/db/client";
 import { authenticateService, consumeRateLimit, type ServiceContext } from "./auth";
 import { ApiError } from "./http";
-import { SERVICE_SCOPES } from "./scopes";
+import { DEFAULT_OAUTH_SCOPES, isOAuthScope, OAUTH_SCOPES, scopesForRole, type OAuthScope } from "./scopes";
 
 /**
  * OAuth 2.1 authorization for the MCP endpoint (MCP authorization spec), so a
@@ -74,7 +74,7 @@ export function protectedResourceMetadata(request: Request) {
   return {
     resource: mcpResource(request),
     authorization_servers: [publicOrigin(request)],
-    scopes_supported: [...SERVICE_SCOPES],
+    scopes_supported: [...OAUTH_SCOPES],
     bearer_methods_supported: ["header"],
     resource_name: "OpenReply",
   };
@@ -88,7 +88,7 @@ export function authorizationServerMetadata(request: Request) {
     authorization_endpoint: `${issuer}${AUTHORIZE_PATH}`,
     token_endpoint: `${issuer}/api/oauth/token`,
     registration_endpoint: `${issuer}/api/oauth/register`,
-    scopes_supported: [...SERVICE_SCOPES],
+    scopes_supported: [...OAUTH_SCOPES],
     response_types_supported: ["code"],
     response_modes_supported: ["query"],
     grant_types_supported: GRANT_TYPES,
@@ -101,7 +101,7 @@ export function authorizationServerMetadata(request: Request) {
 /** Adds the 401 challenge that lets an MCP client discover how to sign in. */
 export function withMcpChallenge(request: Request, response: Response) {
   if (response.status !== 401) return response;
-  const params = [`resource_metadata="${resourceMetadataUrl(request)}"`, `scope="${SERVICE_SCOPES.join(" ")}"`];
+  const params = [`resource_metadata="${resourceMetadataUrl(request)}"`, `scope="${DEFAULT_OAUTH_SCOPES.join(" ")}"`];
   if (request.headers.has("authorization")) params.unshift('error="invalid_token"');
   response.headers.set("WWW-Authenticate", `Bearer ${params.join(", ")}`);
   return response;
@@ -174,14 +174,14 @@ export async function registerClient(input: unknown) {
     grant_types: [...new Set(grant_types)],
     response_types: ["code"],
     token_endpoint_auth_method: authMethod,
-    scope: SERVICE_SCOPES.join(" "),
+    scope: OAUTH_SCOPES.join(" "),
     ...(clientSecret ? { client_secret: clientSecret, client_secret_expires_at: 0 } : {}),
   };
 }
 
 export type AuthorizationRequest = {
   clientId: string; clientName: string; redirectUri: string; codeChallenge: string;
-  state?: string; scopes: string[]; resource: string;
+  state?: string; requestedScopes: OAuthScope[]; resource: string;
 };
 export type AuthorizationFailure = "missing_client" | "unknown_client" | "redirect_mismatch" | "invalid_request";
 export type ParsedAuthorization =
@@ -202,7 +202,8 @@ export function authorizationRedirect(redirectUri: string, values: Record<string
  * redirected: anyone can register a client with any redirect URI, so redirecting errors
  * would make this endpoint an open redirector (RFC 9700 §4.11.1). The only redirects are
  * the user's own Allow or Cancel on the consent screen, which names the destination.
- * Unknown scopes are ignored; the grant is always the read-only scope (RFC 6749 §3.3).
+ * Requested scopes only pre-select the consent screen; the user decides what to grant, and
+ * unknown scopes are ignored (RFC 6749 §3.3).
  */
 export async function parseAuthorizationRequest(params: Record<string, string | string[] | undefined>, request?: Request): Promise<ParsedAuthorization> {
   const single = (name: string) => { const value = params[name]; return Array.isArray(value) ? null : value || undefined; };
@@ -227,23 +228,24 @@ export async function parseAuthorizationRequest(params: Record<string, string | 
   }
   return { ok: true, value: {
     clientId, clientName: client.name, redirectUri, codeChallenge, state,
-    scopes: [...SERVICE_SCOPES], resource: mcpResource(request),
+    requestedScopes: [...new Set((single("scope") ?? "").split(" ").filter(isOAuthScope))], resource: mcpResource(request),
   } };
 }
 
 /** Records the user's consent and returns the single-use authorization code. */
-export async function issueAuthorizationCode(value: AuthorizationRequest, userId: string, workspaceId: string) {
+export async function issueAuthorizationCode(value: AuthorizationRequest, userId: string, workspaceId: string, scopes: OAuthScope[]) {
   const code = newSecret("orc");
   await prisma.oAuthGrant.create({ data: {
-    clientId: value.clientId, userId, workspaceId, scopes: value.scopes, resource: value.resource,
+    clientId: value.clientId, userId, workspaceId, scopes, resource: value.resource,
     redirectUri: value.redirectUri, codeHash: sha256(code), codeChallenge: value.codeChallenge,
     codeExpiresAt: new Date(Date.now() + CODE_TTL_MS),
   } });
   return code;
 }
 
-const isMember = async (userId: string, workspaceId: string) =>
-  Boolean(await prisma.workspaceMember.findUnique({ where: { workspaceId_userId: { workspaceId, userId } }, select: { id: true } }));
+const memberRole = async (userId: string, workspaceId: string) =>
+  (await prisma.workspaceMember.findUnique({ where: { workspaceId_userId: { workspaceId, userId } }, select: { role: true } }))?.role ?? null;
+const isMember = async (userId: string, workspaceId: string) => Boolean(await memberRole(userId, workspaceId));
 
 const revokeGrant = (id: string) => prisma.oAuthGrant.updateMany({ where: { id, revokedAt: null }, data: { revokedAt: new Date() } });
 
@@ -387,11 +389,15 @@ export async function authenticateMcp(request: Request): Promise<ServiceContext>
     select: { id: true, userId: true, workspaceId: true, scopes: true, resource: true, revokedAt: true, accessExpiresAt: true },
   });
   if (!grant || grant.revokedAt || !grant.accessExpiresAt || grant.accessExpiresAt <= new Date()
-    || grant.resource !== mcpResource(request) || !(await isMember(grant.userId, grant.workspaceId))) {
+    || grant.resource !== mcpResource(request)) {
     throw new ApiError("Invalid or expired access token", 401);
   }
+  const role = await memberRole(grant.userId, grant.workspaceId);
+  if (!role) throw new ApiError("Invalid or expired access token", 401);
   await consumeRateLimit(`integration-rate:${grant.id}`, 120, 60);
   await prisma.oAuthGrant.update({ where: { id: grant.id }, data: { lastUsedAt: new Date() } });
-  // keyId identifies the credential: a service key id, or here the OAuth grant id.
-  return { workspaceId: grant.workspaceId, keyId: grant.id, scopes: grant.scopes };
+  // keyId identifies the credential: a service key id, or here the OAuth grant id. Scopes
+  // are cut to what the user's role allows today, so a demoted admin's app loses writes.
+  const roleScopes: string[] = scopesForRole(role);
+  return { workspaceId: grant.workspaceId, keyId: grant.id, userId: grant.userId, scopes: grant.scopes.filter(scope => roleScopes.includes(scope)) };
 }

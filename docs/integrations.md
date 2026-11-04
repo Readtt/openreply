@@ -38,13 +38,46 @@ The client is challenged with `401` and `WWW-Authenticate: Bearer resource_metad
 reads `/.well-known/oauth-protected-resource/api/mcp` and
 `/.well-known/oauth-authorization-server`, registers itself at
 `/api/oauth/register` (RFC 7591) and opens `/oauth/authorize`. You sign in with
-your usual magic link and approve read-only access. The consent screen shows the
+your usual magic link and tick what the app may do. The consent screen shows the
 app's self-declared name and the address you will be sent back to; approve only
 apps you started connecting yourself.
 
-- Any workspace member can connect. The grant is `campaigns:read` only, whatever
-  the client asks for, and is bound to that user and their workspace: it stops
-  working as soon as the user leaves the workspace.
+### Permissions
+
+| Permission | Tools | Who can grant it |
+| --- | --- | --- |
+| View campaigns and results (`campaigns:read`) | `list_campaigns`, `get_campaign`, `get_campaign_stats`, `get_campaign_results`, `get_dashboard_stats`, `list_dm_logs` | everyone |
+| Create and edit campaigns (`campaigns:write`) | `create_campaign`, `update_campaign`, `duplicate_campaign`, `pause_campaign`, `delete_campaign` | owners, admins |
+| Turn campaigns on (`campaigns:activate`) | `activate_campaign`; also needed to edit a live campaign | owners, admins |
+| View Instagram accounts and posts (`instagram:read`) | `list_instagram_accounts`, `get_instagram_profile`, `get_instagram_overview` (followers, per-post views, reach, likes, comments, saves, shares), `list_instagram_posts` | everyone |
+| Read your inbox (`inbox:read`) | `list_conversations`, `get_conversation` | everyone |
+| Send DMs (`inbox:send`) | `send_message` | everyone |
+| View workspace (`workspace:read`) | `get_workspace_members`, `get_diagnostics` | everyone |
+
+The read permissions for campaigns and Instagram start ticked; the rest are
+opt-in. The tools behind a permission call the same API routes as the dashboard,
+as the user who connected, so they see exactly what that user sees and the
+dashboard's role checks still apply. Each grant is cut to the user's current
+role on every request: an admin who is made a member loses the write tools.
+
+Safety rules on top of the dashboard's:
+
+- Campaigns created through MCP, and duplicates, always start paused. Turning
+  one on, or editing one that is live, needs `campaigns:activate`.
+- `delete_campaign` only deletes paused campaigns; it removes their DM history
+  and tracked links and cannot be undone.
+- `send_message` sends a real DM; Instagram allows it within 24 hours of the
+  person's last message.
+- Tools never return Instagram tokens, commenter or comment ids, invitation
+  links or report share links. Connecting Instagram, managing members, API keys
+  and public report sharing stay in the dashboard.
+
+Every tool carries MCP annotations (`readOnlyHint`, `destructiveHint`,
+`idempotentHint`, `openWorldHint`) so clients can ask before changes, and
+object results are also returned as `structuredContent`.
+
+- Any workspace member can connect, and a grant is bound to that user and their
+  workspace: it stops working as soon as the user leaves the workspace.
 - See and disconnect apps under **API & MCP → Connected apps**. Members see
   their own connections; owners and admins see and can disconnect everyone's.
 - PKCE (`S256`) is required. Access tokens last one hour; refresh tokens last
@@ -60,6 +93,8 @@ apps you started connecting yourself.
   the token audience, so changing it requires reconnecting clients.
 
 OAuth tokens are accepted only by `/api/mcp`. The REST API keeps using service keys.
+Service keys are not tied to a person, so with a key the MCP server offers only
+the three read-only campaign tools below.
 
 ## MCP clients with a service key
 

@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import { useI18n } from "@/lib/i18n/provider";
 
 type Key = { id: string; name: string; expiresAt: string; revokedAt: string | null };
-type ConnectedApp = { id: string; name: string; userEmail: string | null; createdAt: string; lastUsedAt: string | null };
+type ConnectedApp = { id: string; name: string; scopes: string[]; userEmail: string | null; createdAt: string; lastUsedAt: string | null };
 
 export default function IntegrationsPage() {
   const { t, locale } = useI18n();
@@ -105,14 +105,14 @@ export default function IntegrationsPage() {
       {apps.length === 0 && <p className="text-sm text-muted">{t("No apps connected yet.")}</p>}
       {apps.map(app => <div key={app.id} className="rounded border border-border p-4">
         <strong>{app.name}</strong>
-        <p className="text-sm">campaigns:read · {t("Connected {date}", { date: new Date(app.createdAt).toLocaleDateString(locale) })}{app.userEmail ? ` · ${app.userEmail}` : ""}</p>
+        <p className="text-sm">{app.scopes.join(", ")} · {t("Connected {date}", { date: new Date(app.createdAt).toLocaleDateString(locale) })}{app.userEmail ? ` · ${app.userEmail}` : ""}</p>
         <button disabled={busy} onClick={() => disconnect(app)} className="text-red-500">{t("Disconnect")}</button>
       </div>)}
     </section>
     <section className="space-y-2 text-sm">
       <h2 className="font-semibold">{t("Connection")}</h2>
       <p>MCP: <code>{origin}/api/mcp</code> · REST: <code>/api/v1/campaigns</code></p>
-      <p>{t("Clients that support OAuth, such as Claude, ChatGPT, Cursor and VS Code, only need the MCP URL: you sign in with your OpenReply account and approve read-only access.")}</p>
+      <p>{t("Clients that support OAuth, such as Claude, ChatGPT, Cursor and VS Code, only need the MCP URL: you sign in with your OpenReply account and choose what they can do.")}</p>
       <p>{t("Clients without OAuth, and the REST API, send a service key in an Authorization: Bearer header.")}</p>
       <p>{t("Campaign lists are limited to 100. Use get_campaign for complete settings and destination links; clicks are raw requests, not unique recipients.")}</p>
     </section>

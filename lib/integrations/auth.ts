@@ -3,10 +3,11 @@ import Redis from "ioredis";
 import { prisma } from "@/lib/db/client";
 import { ApiError } from "./http";
 
-import { SERVICE_SCOPES } from "./scopes";
+import { SERVICE_SCOPES, type OAuthScope } from "./scopes";
 export { SERVICE_SCOPES } from "./scopes";
 export type ServiceScope = typeof SERVICE_SCOPES[number];
-export type ServiceContext = { workspaceId: string; keyId: string; scopes: string[] };
+/** userId is set only for an OAuth grant, whose tools act as that signed-in user. */
+export type ServiceContext = { workspaceId: string; keyId: string; scopes: string[]; userId?: string };
 export const hashServiceToken = (token: string) => createHash("sha256").update(token).digest("hex");
 export const newServiceToken = () => `orp_${randomBytes(32).toString("base64url")}`;
 let redis: Redis | undefined;
@@ -25,7 +26,7 @@ async function limiter() {
   return redis;
 }
 
-export function requireScope(context: ServiceContext, scope: ServiceScope) {
+export function requireScope(context: ServiceContext, scope: OAuthScope) {
   if (!context.scopes.includes(scope)) throw new ApiError(`Missing scope: ${scope}`, 403);
 }
 

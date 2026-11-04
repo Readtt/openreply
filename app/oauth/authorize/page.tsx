@@ -1,14 +1,26 @@
 import type { Metadata } from "next";
 import { redirect } from "next/navigation";
 import { auth } from "@/lib/auth";
+import type { StaticMessageKey } from "@/lib/i18n";
 import { getI18n } from "@/lib/i18n/server";
 import { AUTHORIZE_PATH, parseAuthorizationRequest } from "@/lib/integrations/oauth";
+import { DEFAULT_OAUTH_SCOPES, scopesForRole, type OAuthScope } from "@/lib/integrations/scopes";
 import { getCurrentWorkspaceContext } from "@/lib/workspace-access";
 
 type SearchParams = Record<string, string | string[] | undefined>;
 
 // Only the OAuth request travels through the consent form; nothing else is echoed back.
 const FORWARDED = ["client_id", "redirect_uri", "response_type", "code_challenge", "code_challenge_method", "state", "scope", "resource"];
+
+const SCOPE_TEXT: Record<OAuthScope, [StaticMessageKey, StaticMessageKey]> = {
+  "campaigns:read": ["View campaigns and results", "Settings, links, DMs sent, clicks, DM logs and the dashboard."],
+  "campaigns:write": ["Create and edit campaigns", "Create, edit, duplicate, pause and delete paused campaigns. New campaigns start paused."],
+  "campaigns:activate": ["Turn campaigns on", "Start campaigns and edit live ones. A live campaign sends DMs to people who comment."],
+  "instagram:read": ["View Instagram accounts and posts", "Followers, posts, reels and videos with views, reach, likes, comments, saves and shares."],
+  "inbox:read": ["Read your inbox", "Your Instagram DM conversations and messages."],
+  "inbox:send": ["Send DMs", "Reply to people from your Instagram account. Messages can't be unsent."],
+  "workspace:read": ["View workspace", "Members, roles, pending invitations and diagnostics."],
+};
 
 export async function generateMetadata(): Promise<Metadata> {
   const { t } = await getI18n();
@@ -49,36 +61,52 @@ export default async function AuthorizePage({ searchParams }: { searchParams: Pr
     redirect(`/login?callbackUrl=${encodeURIComponent(`${AUTHORIZE_PATH}?${new URLSearchParams(forwarded)}`)}`);
   }
   const app = parsed.value.clientName;
+  // Only what the user's role allows is offered. The app's request, or else the read
+  // defaults, starts ticked; the user decides.
+  const offered = scopesForRole(context.role);
+  const requested = parsed.value.requestedScopes.filter(scope => offered.includes(scope));
+  const preselected = requested.length ? requested : DEFAULT_OAUTH_SCOPES.filter(scope => offered.includes(scope));
 
   return (
-    <div className="min-h-screen flex items-center justify-center px-6">
+    <div className="min-h-screen flex items-center justify-center px-6 py-10">
       <div className="panel w-full max-w-md rounded p-8 shadow-black/40">
         <h1 className="text-xl font-semibold text-foreground">{t("Connect {app} to OpenReply", { app })}</h1>
         <p className="mt-3 text-sm leading-relaxed text-muted">
-          {t("{app} is asking for read-only access to {workspace}.", { app, workspace: context.workspace.name })}
+          {t("{app} wants access to {workspace}.", { app, workspace: context.workspace.name })}
         </p>
-        <p className="mt-5 text-sm font-medium text-foreground">{t("It will be able to:")}</p>
-        <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-foreground">
-          <li>{t("Read your campaigns, their settings and destination links")}</li>
-          <li>{t("Read campaign send counts and link clicks")}</li>
-        </ul>
-        <p className="mt-3 text-sm text-muted">{t("It cannot edit campaigns, send messages or see your Instagram connection.")}</p>
-        <div className="mt-5 space-y-1 border-t border-border pt-4 text-xs leading-relaxed text-muted">
-          <p>{t("Signed in as {email}", { email: session.user.email ?? "" })}</p>
-          <p>{t("After you allow access, you will be sent to {destination}.", { destination: destination(parsed.value.redirectUri) })}</p>
-          <p>{t("Only connect apps you trust. You can disconnect it at any time under API & MCP.")}</p>
-        </div>
-        <form method="post" action="/api/oauth/authorize" className="mt-6 flex gap-3">
+        <form method="post" action="/api/oauth/authorize" className="mt-5">
+          <fieldset>
+            <legend className="text-sm font-medium text-foreground">{t("Choose what it can do:")}</legend>
+            <div className="mt-3 space-y-3">
+              {offered.map(scope => (
+                <label key={scope} className="flex items-start gap-3 text-sm">
+                  <input type="checkbox" name="grant" value={scope} defaultChecked={preselected.includes(scope)} className="mt-1 h-4 w-4 shrink-0" />
+                  <span>
+                    <span className="block font-medium text-foreground">{t(SCOPE_TEXT[scope][0])}</span>
+                    <span className="block text-muted">{t(SCOPE_TEXT[scope][1])}</span>
+                  </span>
+                </label>
+              ))}
+            </div>
+            {context.role === "MEMBER" && <p className="mt-3 text-xs text-muted">{t("Creating and changing campaigns needs an owner or admin.")}</p>}
+          </fieldset>
+          <div className="mt-5 space-y-1 border-t border-border pt-4 text-xs leading-relaxed text-muted">
+            <p>{t("Signed in as {email}", { email: session.user.email ?? "" })}</p>
+            <p>{t("After you allow access, you will be sent to {destination}.", { destination: destination(parsed.value.redirectUri) })}</p>
+            <p>{t("Only connect apps you trust. You can disconnect it at any time under API & MCP.")}</p>
+          </div>
           {forwarded.map(([name, value]) => <input key={name} type="hidden" name={name} value={value} />)}
           <input type="hidden" name="workspace_id" value={context.workspaceId} />
-          <button type="submit" name="decision" value="deny"
-            className="flex-1 rounded border border-border px-4 py-3 text-sm font-semibold text-foreground transition-colors hover:bg-surface">
-            {t("Cancel")}
-          </button>
-          <button type="submit" name="decision" value="allow"
-            className="flex-1 rounded bg-accent px-4 py-3 text-sm font-semibold text-white shadow-indigo-500/25 transition-all hover:shadow-indigo-500/30">
-            {t("Allow access")}
-          </button>
+          <div className="mt-6 flex gap-3">
+            <button type="submit" name="decision" value="deny"
+              className="flex-1 rounded border border-border px-4 py-3 text-sm font-semibold text-foreground transition-colors hover:bg-surface">
+              {t("Cancel")}
+            </button>
+            <button type="submit" name="decision" value="allow"
+              className="flex-1 rounded bg-accent px-4 py-3 text-sm font-semibold text-white shadow-indigo-500/25 transition-all hover:shadow-indigo-500/30">
+              {t("Allow access")}
+            </button>
+          </div>
         </form>
       </div>
     </div>
