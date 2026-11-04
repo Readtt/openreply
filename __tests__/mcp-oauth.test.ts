@@ -29,11 +29,12 @@ const state = vi.hoisted(() => {
     },
     workspaceMember: {
       findUnique: vi.fn(async ({ where }: { where: { workspaceId_userId: { workspaceId: string; userId: string } } }) =>
-        members.has(`${where.workspaceId_userId.workspaceId}:${where.workspaceId_userId.userId}`) ? { id: "member" } : null),
+        members.has(`${where.workspaceId_userId.workspaceId}:${where.workspaceId_userId.userId}`) ? { id: "member", role: role.value } : null),
     },
     serviceKey: { findUnique: vi.fn(async () => null), update: vi.fn() },
   };
-  return { clients, grants, members, prisma, eval: vi.fn(), context: vi.fn() };
+  const role = { value: "OWNER" as "OWNER" | "ADMIN" | "MEMBER" };
+  return { clients, grants, members, role, prisma, eval: vi.fn(), context: vi.fn() };
 });
 vi.mock("@/lib/db/client", () => ({ prisma: state.prisma }));
 vi.mock("ioredis", () => ({ default: class { status = "ready"; eval = state.eval; listenerCount() { return 1; } } }));
@@ -46,6 +47,7 @@ import {
   authenticateMcp, authorizationServerMetadata, exchangeToken, isValidRedirectUri, issueAuthorizationCode,
   matchesRedirectUri, parseAuthorizationRequest, pkceChallenge, protectedResourceMetadata, registerClient,
 } from "../lib/integrations/oauth";
+import { OAUTH_SCOPES } from "../lib/integrations/scopes";
 import { POST as mcp } from "../app/api/mcp/route";
 import { GET as resourceMetadata } from "../app/.well-known/oauth-protected-resource/[[...path]]/route";
 import { POST as token } from "../app/api/oauth/token/route";
@@ -71,7 +73,7 @@ async function authorize(clientId: string, extra: Record<string, string> = {}) {
   const parsed = await parseAuthorizationRequest({ client_id: clientId, redirect_uri: redirectUri, response_type: "code",
     code_challenge: challenge, code_challenge_method: "S256", state: "xyz", ...extra });
   if (!parsed.ok) throw new Error("authorization request rejected");
-  return issueAuthorizationCode(parsed.value, "user", "workspace");
+  return issueAuthorizationCode(parsed.value, "user", "workspace", ["campaigns:read"]);
 }
 async function tokens(clientId: string) {
   const code = await authorize(clientId);
@@ -85,6 +87,7 @@ beforeEach(() => {
   vi.stubEnv("REDIS_URL", "redis://localhost:6379");
   state.clients.clear(); state.grants.clear(); state.members.clear();
   state.members.add("workspace:user");
+  state.role.value = "OWNER";
   state.eval.mockReset().mockResolvedValue(1);
   state.context.mockResolvedValue({ userId: "user", workspaceId: "workspace", role: "MEMBER" });
 });
@@ -92,7 +95,7 @@ beforeEach(() => {
 describe("discovery", () => {
   it("publishes resource and authorization server metadata from NEXTAUTH_URL", async () => {
     const request = new Request("http://internal:3000/x");
-    expect(protectedResourceMetadata(request)).toMatchObject({ resource: `${base}/api/mcp`, authorization_servers: [base], scopes_supported: ["campaigns:read"] });
+    expect(protectedResourceMetadata(request)).toMatchObject({ resource: `${base}/api/mcp`, authorization_servers: [base], scopes_supported: [...OAUTH_SCOPES] });
     expect(authorizationServerMetadata(request)).toMatchObject({
       issuer: base, authorization_endpoint: `${base}/oauth/authorize`, token_endpoint: `${base}/api/oauth/token`,
       registration_endpoint: `${base}/api/oauth/register`, code_challenge_methods_supported: ["S256"],
@@ -105,7 +108,7 @@ describe("discovery", () => {
   it("answers an unauthenticated MCP request with the OAuth challenge", async () => {
     const response = await mcp(mcpRequest());
     expect(response.status).toBe(401);
-    expect(response.headers.get("www-authenticate")).toBe(`Bearer resource_metadata="${base}/.well-known/oauth-protected-resource/api/mcp", scope="campaigns:read"`);
+    expect(response.headers.get("www-authenticate")).toBe(`Bearer resource_metadata="${base}/.well-known/oauth-protected-resource/api/mcp", scope="campaigns:read instagram:read"`);
     const invalid = await mcp(mcpRequest(`Bearer ora_${"x".repeat(43)}`));
     expect(invalid.status).toBe(401);
     expect(invalid.headers.get("www-authenticate")).toMatch(/^Bearer error="invalid_token", resource_metadata=/);
@@ -184,11 +187,11 @@ describe("authorization requests", () => {
     const target = await parseAuthorizationRequest({ client_id: attacker, response_type: "code", code_challenge: challenge, code_challenge_method: "S256", resource: "https://other.example/mcp" });
     expect(target).toMatchObject({ detail: `This server only issues tokens for ${base}/api/mcp.` });
   });
-  it("grants only the read scope, whatever was requested", async () => {
+  it("keeps only known requested scopes, which merely pre-select the consent screen", async () => {
     const clientId = await publicClient();
     const parsed = await parseAuthorizationRequest({ client_id: clientId, response_type: "code", code_challenge: challenge,
-      code_challenge_method: "S256", scope: "campaigns:write claudeai", resource: `${base}/api/mcp/` });
-    expect(parsed).toMatchObject({ ok: true, value: { redirectUri, scopes: ["campaigns:read"], resource: `${base}/api/mcp` } });
+      code_challenge_method: "S256", scope: "campaigns:write claudeai campaigns:write", resource: `${base}/api/mcp/` });
+    expect(parsed).toMatchObject({ ok: true, value: { redirectUri, requestedScopes: ["campaigns:write"], resource: `${base}/api/mcp` } });
   });
 });
 
@@ -206,9 +209,10 @@ describe("token endpoint", () => {
     const body = await ok.json();
     expect(body).toMatchObject({ token_type: "Bearer", expires_in: 3600, scope: "campaigns:read" });
     expect(body.access_token).toMatch(/^ora_[A-Za-z0-9_-]{43}$/);
-    expect(await authenticateMcp(mcpRequest(`Bearer ${body.access_token}`))).toEqual({ workspaceId: "workspace", keyId: "grant_1", scopes: ["campaigns:read"] });
+    expect(await authenticateMcp(mcpRequest(`Bearer ${body.access_token}`))).toEqual({ workspaceId: "workspace", keyId: "grant_1", userId: "user", scopes: ["campaigns:read"] });
     const listed = await (await mcp(mcpRequest(`Bearer ${body.access_token}`))).json();
-    expect(listed.result.tools.map((tool: { name: string }) => tool.name)).toEqual(["list_campaigns", "get_campaign", "get_campaign_stats"]);
+    expect(listed.result.tools.map((tool: { name: string }) => tool.name)).toEqual(
+      ["list_campaigns", "get_campaign", "get_campaign_stats", "get_campaign_results", "get_dashboard_stats", "list_dm_logs"]);
     // Replaying the code revokes everything issued from it.
     expect(await (await exchange({ code_verifier: verifier })).json()).toMatchObject({ error: "invalid_grant" });
     await expect(authenticateMcp(mcpRequest(`Bearer ${body.access_token}`))).rejects.toMatchObject({ status: 401 });
@@ -285,13 +289,35 @@ describe("token endpoint", () => {
 });
 
 describe("consent and connected apps", () => {
-  const consentForm = (values: Record<string, string>, origin = base) => new Request(`${base}/api/oauth/authorize`, {
+  const consentForm = (values: [string, string][], origin = base) => new Request(`${base}/api/oauth/authorize`, {
     method: "POST", headers: { "content-type": "application/x-www-form-urlencoded", origin }, body: new URLSearchParams(values),
   });
-  async function consentValues(decision: string) {
-    return { client_id: await publicClient(), redirect_uri: redirectUri, response_type: "code", code_challenge: challenge,
-      code_challenge_method: "S256", state: "abc", workspace_id: "workspace", decision };
+  async function consentValues(decision: string, grants = ["campaigns:read"]): Promise<[string, string][]> {
+    return [...Object.entries({ client_id: await publicClient(), redirect_uri: redirectUri, response_type: "code", code_challenge: challenge,
+      code_challenge_method: "S256", state: "abc", workspace_id: "workspace", decision }), ...grants.map(scope => ["grant", scope] as [string, string])];
   }
+  it("grants exactly the ticked permissions the user's role allows, and nothing for an empty selection", async () => {
+    state.context.mockResolvedValue({ userId: "user", workspaceId: "workspace", role: "MEMBER" });
+    const member = await consent(consentForm(await consentValues("allow", ["campaigns:read", "campaigns:write", "campaigns:activate", "inbox:read", "bogus"])));
+    expect(member.status).toBe(303);
+    expect(state.grants.get("grant_1")!.scopes).toEqual(["campaigns:read", "inbox:read"]);
+    state.context.mockResolvedValue({ userId: "user", workspaceId: "workspace", role: "ADMIN" });
+    await consent(consentForm(await consentValues("allow", ["campaigns:write", "campaigns:activate"])));
+    expect(state.grants.get("grant_2")!.scopes).toEqual(["campaigns:write", "campaigns:activate"]);
+    const nothing = await consent(consentForm(await consentValues("allow", [])));
+    expect(new URL(nothing.headers.get("location")!).searchParams.get("error")).toBe("access_denied");
+    expect(state.grants.size).toBe(2);
+  });
+  it("drops scopes a later role change no longer allows", async () => {
+    const clientId = await publicClient();
+    const parsed = await parseAuthorizationRequest({ client_id: clientId, response_type: "code", code_challenge: challenge, code_challenge_method: "S256" });
+    if (!parsed.ok) throw new Error("rejected");
+    const code = await issueAuthorizationCode(parsed.value, "user", "workspace", ["campaigns:read", "campaigns:write", "inbox:send"]);
+    const issued = await exchangeToken(form({}), new URLSearchParams({ grant_type: "authorization_code", code, code_verifier: verifier, client_id: clientId }));
+    expect((await authenticateMcp(mcpRequest(`Bearer ${issued.access_token}`))).scopes).toEqual(["campaigns:read", "campaigns:write", "inbox:send"]);
+    state.role.value = "MEMBER";
+    expect((await authenticateMcp(mcpRequest(`Bearer ${issued.access_token}`))).scopes).toEqual(["campaigns:read", "inbox:send"]);
+  });
   it("issues a code only for a same-origin approval by the signed-in user", async () => {
     expect((await consent(consentForm(await consentValues("allow"), "https://evil.example"))).status).toBe(403);
     expect((await consent(new Request(`${base}/api/oauth/authorize`, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: "" }))).status).toBe(403);

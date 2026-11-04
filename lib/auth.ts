@@ -5,6 +5,7 @@ import { PrismaAdapter } from "@auth/prisma-adapter";
 import { prisma } from "@/lib/db/client";
 import { ensureWorkspaceForUser, getPrimaryWorkspace } from "@/lib/workspace";
 import { isEmailAllowedToSignIn } from "@/lib/env";
+import { getDelegatedUser } from "@/lib/delegated-user";
 
 type AdapterPrismaClient = Parameters<typeof PrismaAdapter>[0];
 
@@ -64,11 +65,17 @@ export const authConfig = {
 export const { handlers, auth, signIn, signOut } = NextAuth(authConfig);
 
 export async function getCurrentUserId(): Promise<string | null> {
+  const delegated = getDelegatedUser();
+  if (delegated) return delegated.userId;
   const session = await auth();
   return session?.user?.id ?? null;
 }
 
 export async function getCurrentWorkspaceId(): Promise<string | null> {
+  // An MCP grant is pinned to the workspace the user approved; its membership is
+  // checked before every delegated call.
+  const delegated = getDelegatedUser();
+  if (delegated) return delegated.workspaceId;
   const userId = await getCurrentUserId();
   if (!userId) return null;
 

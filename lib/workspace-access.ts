@@ -1,6 +1,7 @@
 import type { Workspace, WorkspaceRole } from "@/app/generated/prisma/client";
 import { getCurrentUserId } from "@/lib/auth";
 import { prisma } from "@/lib/db/client";
+import { getDelegatedUser } from "@/lib/delegated-user";
 import { ensureWorkspaceForUser } from "@/lib/workspace";
 
 export type WorkspaceContext = {
@@ -32,6 +33,18 @@ export function canManageBilling(role: WorkspaceRole) {
 }
 
 export async function getCurrentWorkspaceContext(): Promise<WorkspaceContext | null> {
+  const delegated = getDelegatedUser();
+  if (delegated) {
+    // Pinned to the granted workspace, with the user's current role in it.
+    const membership = await prisma.workspaceMember.findUnique({
+      where: { workspaceId_userId: { workspaceId: delegated.workspaceId, userId: delegated.userId } },
+      include: { workspace: true },
+    });
+    return membership
+      ? { userId: delegated.userId, workspaceId: delegated.workspaceId, workspace: membership.workspace, role: membership.role }
+      : null;
+  }
+
   const userId = await getCurrentUserId();
   if (!userId) return null;
 

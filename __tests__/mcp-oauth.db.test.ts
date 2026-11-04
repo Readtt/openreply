@@ -9,6 +9,8 @@ import { PrismaClient } from "../app/generated/prisma/client";
 const state = vi.hoisted(() => ({ db: undefined as unknown as import("../app/generated/prisma/client").PrismaClient }));
 vi.mock("@/lib/db/client", () => ({ get prisma() { return state.db; } }));
 vi.mock("ioredis", () => ({ default: class { status = "ready"; eval = async () => 1; listenerCount() { return 1; } } }));
+// Tools act through the real dashboard routes; only the cookie session is out of the picture.
+vi.mock("next-auth", () => ({ default: () => ({ handlers: {}, auth: async () => null, signIn: async () => undefined, signOut: async () => undefined }) }));
 import { authenticateMcp, exchangeToken, issueAuthorizationCode, parseAuthorizationRequest, registerClient } from "../lib/integrations/oauth";
 import { callTool } from "../lib/integrations/mcp";
 
@@ -59,7 +61,7 @@ describe.skipIf(!databaseUrl)("MCP OAuth on real PostgreSQL", () => {
       code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM", code_challenge_method: "S256", resource: `${base}/api/mcp` });
     expect(parsed.ok).toBe(true);
     if (!parsed.ok) return;
-    const code = await issueAuthorizationCode(parsed.value, "user", "workspace");
+    const code = await issueAuthorizationCode(parsed.value, "user", "workspace", ["campaigns:read"]);
     const issued = await tokenRequest({ grant_type: "authorization_code", code, code_verifier: verifier, redirect_uri: redirectUri, client_id: client.client_id });
 
     const row = await state.db.oAuthGrant.findFirstOrThrow({ where: { clientId: client.client_id } });
@@ -68,7 +70,7 @@ describe.skipIf(!databaseUrl)("MCP OAuth on real PostgreSQL", () => {
     expect(row).toMatchObject({ userId: "user", workspaceId: "workspace", scopes: ["campaigns:read"], redirectUri, resource: `${base}/api/mcp` });
 
     const context = await authenticateMcp(mcpRequest(issued.access_token));
-    expect(context).toEqual({ workspaceId: "workspace", keyId: row.id, scopes: ["campaigns:read"] });
+    expect(context).toEqual({ workspaceId: "workspace", keyId: row.id, userId: "user", scopes: ["campaigns:read"] });
     const campaigns = await callTool(context, "list_campaigns", {}) as { id: string }[];
     expect(campaigns.map(campaign => campaign.id)).toEqual(["campaign_workspace"]);
     await expect(callTool(context, "get_campaign", { id: "campaign_other" })).rejects.toMatchObject({ status: 404 });
@@ -90,12 +92,58 @@ describe.skipIf(!databaseUrl)("MCP OAuth on real PostgreSQL", () => {
       .rejects.toMatchObject({ code: "invalid_grant" });
   });
 
+  it("runs dashboard actions through the real routes as the signed-in user", async () => {
+    await state.db.user.createMany({ data: [{ id: "admin", email: "admin@example.test" }, { id: "viewer", email: "viewer@example.test" }] });
+    await state.db.workspace.create({ data: { id: "acme", name: "Acme", ownerId: "admin" } });
+    await state.db.workspaceMember.createMany({ data: [{ workspaceId: "acme", userId: "admin", role: "OWNER" }, { workspaceId: "acme", userId: "viewer", role: "MEMBER" }] });
+    await state.db.instagramAccount.create({ data: { id: "account_acme", workspaceId: "acme", instagramId: "acme", username: "acme_shop", accessToken: "local-only-secret" } });
+    const as = (userId: string, scopes: string[]) => ({ workspaceId: "acme", keyId: "grant", userId, scopes });
+    const admin = as("admin", ["campaigns:read", "campaigns:write", "campaigns:activate", "instagram:read", "workspace:read"]);
+    const row = (id: string) => state.db.automation.findUnique({ where: { id } });
+
+    const created = await callTool(admin, "create_campaign", { name: "Spring guide", dmMessage: "Here is the guide", matchAnyPost: true,
+      keywords: ["GUIDE"], trackedDestinationUrl: "https://example.test/guide" }) as { id: string };
+    expect(await row(created.id)).toMatchObject({ workspaceId: "acme", instagramAccountId: "account_acme", isActive: false, keywords: ["GUIDE"] });
+    await expect(callTool(admin, "create_campaign", { name: "No trigger", dmMessage: "x", keywords: ["A"] })).rejects.toThrow(/Choose which post/);
+
+    await callTool(admin, "update_campaign", { campaign_id: created.id, name: "Spring guide v2" });
+    await callTool(admin, "activate_campaign", { campaign_id: created.id });
+    expect(await row(created.id)).toMatchObject({ name: "Spring guide v2", isActive: true });
+    await expect(callTool(as("admin", ["campaigns:write"]), "update_campaign", { campaign_id: created.id, name: "Sneaky" })).rejects.toMatchObject({ status: 403 });
+    await expect(callTool(admin, "delete_campaign", { campaign_id: created.id })).rejects.toMatchObject({ status: 409 });
+    expect((await row(created.id))?.name).toBe("Spring guide v2");
+
+    const copy = await callTool(admin, "duplicate_campaign", { campaign_id: created.id }) as { id: string; isActive: boolean };
+    expect(copy.isActive).toBe(false);
+    await state.db.dmLog.create({ data: { workspaceId: "acme", automationId: created.id, instagramAccountId: "account_acme", commenterId: "ig-commenter",
+      commenterName: "ana", commentText: "GUIDE please", commentId: "ig-comment", matchedKeyword: "GUIDE", status: "SENT", dmSentAt: new Date() } });
+    const results = await callTool(admin, "get_campaign_results", { campaign_id: created.id }) as { campaigns: { results: { sent: number }; links: unknown[] }[] };
+    expect(results.campaigns[0]).toMatchObject({ name: "Spring guide v2", account: "acme_shop", results: { sent: 1 } });
+    expect(results.campaigns[0].links).toHaveLength(1);
+    const logs = await callTool(admin, "list_dm_logs", {});
+    expect(logs).toMatchObject({ logs: [{ commenter: "ana", campaign: "Spring guide v2", status: "SENT" }], pagination: { total: 1 } });
+    expect(JSON.stringify(logs)).not.toContain("ig-commenter");
+    expect(await callTool(admin, "get_dashboard_stats", {})).toMatchObject({ campaigns: { total: 2, active: 1 }, dms: { total: 1 } });
+    expect(await callTool(admin, "list_instagram_accounts", {})).toEqual({ accounts: [{ id: "account_acme", username: "acme_shop", name: null }] });
+    expect(await callTool(admin, "get_workspace_members", {})).toMatchObject({ yourRole: "OWNER", members: [{ email: "admin@example.test" }, { email: "viewer@example.test" }] });
+
+    // The dashboard's own role check still applies through delegation, and other workspaces stay out of reach.
+    await expect(callTool(as("viewer", ["campaigns:write"]), "pause_campaign", { campaign_id: created.id })).rejects.toMatchObject({ status: 403 });
+    await expect(callTool(admin, "update_campaign", { campaign_id: "campaign_workspace", name: "Hijack" })).rejects.toMatchObject({ status: 404 });
+    expect((await row("campaign_workspace"))?.name).toBe("workspace");
+
+    await callTool(admin, "pause_campaign", { campaign_id: created.id });
+    await callTool(admin, "delete_campaign", { campaign_id: created.id });
+    expect(await row(created.id)).toBeNull();
+    expect(await row(copy.id)).toMatchObject({ isActive: false });
+  });
+
   it("cuts access when membership ends and deletes grants with their user", async () => {
     const client = await registerClient({ redirect_uris: [redirectUri], token_endpoint_auth_method: "none" });
     const parsed = await parseAuthorizationRequest({ client_id: client.client_id, response_type: "code",
       code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM", code_challenge_method: "S256" });
     if (!parsed.ok) throw new Error("rejected");
-    const code = await issueAuthorizationCode(parsed.value, "user", "workspace");
+    const code = await issueAuthorizationCode(parsed.value, "user", "workspace", ["campaigns:read"]);
     const issued = await tokenRequest({ grant_type: "authorization_code", code, code_verifier: verifier, client_id: client.client_id });
     await state.db.workspaceMember.deleteMany({ where: { userId: "user" } });
     await expect(authenticateMcp(mcpRequest(issued.access_token))).rejects.toMatchObject({ status: 401 });
