@@ -81,6 +81,7 @@ async function tokens(clientId: string) {
 beforeEach(() => {
   vi.clearAllMocks();
   vi.stubEnv("NEXTAUTH_URL", base);
+  vi.stubEnv("NEXTAUTH_SECRET", "test-secret-for-refresh-token-macs");
   vi.stubEnv("REDIS_URL", "redis://localhost:6379");
   state.clients.clear(); state.grants.clear(); state.members.clear();
   state.members.add("workspace:user");
@@ -222,7 +223,7 @@ describe("token endpoint", () => {
     state.grants.get("grant_1")!.codeExpiresAt = new Date(0);
     await expect(exchange({})).rejects.toMatchObject({ code: "invalid_grant" });
   });
-  it("rotates refresh tokens and revokes the grant when a rotated one is replayed", async () => {
+  it("rotates refresh tokens and revokes the grant when any rotated one is replayed", async () => {
     const clientId = await publicClient();
     const first = await tokens(clientId);
     const refresh = (refreshToken: string) => exchangeToken(form({}), new URLSearchParams({ grant_type: "refresh_token", refresh_token: refreshToken, client_id: clientId }));
@@ -233,11 +234,27 @@ describe("token endpoint", () => {
     // A concurrent duplicate refresh moments after rotation fails without revoking.
     await expect(refresh(first.refresh_token)).rejects.toMatchObject({ code: "invalid_grant" });
     expect(state.grants.get("grant_1")!.revokedAt).toBeNull();
-    // Later, the same replay means the token leaked: revoke the whole grant.
+    const third = await refresh(second.refresh_token);
+    // A forged token naming the grant cannot revoke it: only tokens this server signed count.
+    const [, nonce] = third.refresh_token.split(".");
+    await expect(refresh(`orr_grant_1.${nonce}.${"A".repeat(43)}`)).rejects.toMatchObject({ code: "invalid_grant" });
+    // Later, the oldest token coming back, two rotations on, means it leaked: revoke the grant.
     state.grants.get("grant_1")!.refreshRotatedAt = new Date(Date.now() - 120_000);
+    expect(state.grants.get("grant_1")!.revokedAt).toBeNull();
     await expect(refresh(first.refresh_token)).rejects.toMatchObject({ code: "invalid_grant" });
     expect(state.grants.get("grant_1")!.revokedAt).toBeInstanceOf(Date);
-    await expect(refresh(second.refresh_token)).rejects.toMatchObject({ code: "invalid_grant" });
+    await expect(refresh(third.refresh_token)).rejects.toMatchObject({ code: "invalid_grant" });
+    await expect(authenticateMcp(mcpRequest(`Bearer ${third.access_token}`))).rejects.toMatchObject({ status: 401 });
+  });
+  it("revokes the winner when the same code is exchanged concurrently", async () => {
+    const clientId = await publicClient();
+    const code = await authorize(clientId);
+    const exchange = () => exchangeToken(form({}), new URLSearchParams({ grant_type: "authorization_code", code, code_verifier: verifier, client_id: clientId }));
+    const [a, b] = await Promise.allSettled([exchange(), exchange()]);
+    const won = [a, b].find(result => result.status === "fulfilled") as PromiseFulfilledResult<{ access_token: string }>;
+    expect([a.status, b.status].sort()).toEqual(["fulfilled", "rejected"]);
+    await expect(authenticateMcp(mcpRequest(`Bearer ${won.value.access_token}`))).rejects.toMatchObject({ status: 401 });
+    expect(state.grants.get("grant_1")!.revokedAt).toBeInstanceOf(Date);
   });
   it("stops working as soon as the user leaves the workspace", async () => {
     const clientId = await publicClient();

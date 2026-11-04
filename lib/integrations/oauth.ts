@@ -1,4 +1,4 @@
-import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { z } from "zod";
 import { prisma } from "@/lib/db/client";
 import { authenticateService, consumeRateLimit, type ServiceContext } from "./auth";
@@ -28,6 +28,7 @@ const GRANT_TYPES = ["authorization_code", "refresh_token"];
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
 const UNSAFE_SCHEMES = new Set(["javascript:", "data:", "file:", "vbscript:", "about:", "blob:", "ws:", "wss:", "ftp:"]);
 const ACCESS_TOKEN = /^Bearer (ora_[A-Za-z0-9_-]{43})$/;
+const REFRESH_TOKEN = /^orr_([A-Za-z0-9_-]{1,64})\.([A-Za-z0-9_-]{43})\.([A-Za-z0-9_-]{43})$/;
 const CODE_VERIFIER = /^[A-Za-z0-9._~-]{43,128}$/;
 const CODE_CHALLENGE = /^[A-Za-z0-9_-]{43}$/;
 
@@ -246,9 +247,20 @@ const isMember = async (userId: string, workspaceId: string) =>
 
 const revokeGrant = (id: string) => prisma.oAuthGrant.updateMany({ where: { id, revokedAt: null }, data: { revokedAt: new Date() } });
 
-function newTokens() {
+/**
+ * Refresh tokens name their grant and carry this MAC, so a token this server issued is
+ * recognised as the grant's however many rotations ago it was replaced, without storing
+ * every consumed token, and a forged one cannot trigger a revocation.
+ */
+function refreshSignature(grantId: string, nonce: string) {
+  if (!process.env.NEXTAUTH_SECRET) throw new Error("NEXTAUTH_SECRET is required");
+  return createHmac("sha256", process.env.NEXTAUTH_SECRET).update(`oauth-refresh:${grantId}.${nonce}`).digest("base64url");
+}
+
+function newTokens(grantId: string) {
   const accessToken = newSecret("ora");
-  const refreshToken = newSecret("orr");
+  const nonce = randomBytes(32).toString("base64url");
+  const refreshToken = `orr_${grantId}.${nonce}.${refreshSignature(grantId, nonce)}`;
   return {
     data: {
       accessTokenHash: sha256(accessToken), accessExpiresAt: new Date(Date.now() + ACCESS_TTL_SECONDS * 1000),
@@ -302,37 +314,43 @@ async function exchangeAuthorizationCode(clientId: string, body: URLSearchParams
   const resource = body.get("resource");
   if (resource && normalizeResource(resource) !== grant.resource) throw new OAuthError("invalid_target", "Unknown resource");
   if (!(await isMember(grant.userId, grant.workspaceId))) throw new OAuthError("invalid_grant", "Access to this workspace was removed");
-  const tokens = newTokens();
+  const tokens = newTokens(grant.id);
   const updated = await prisma.oAuthGrant.updateMany({
     where: { id: grant.id, codeUsedAt: null, revokedAt: null },
     data: { codeUsedAt: new Date(), ...tokens.data },
   });
-  if (updated.count !== 1) throw new OAuthError("invalid_grant", "Authorization code was already used");
+  if (updated.count !== 1) {
+    // A concurrent exchange of the same code won: that is a replay too.
+    await revokeGrant(grant.id);
+    throw new OAuthError("invalid_grant", "Authorization code was already used");
+  }
   return tokens.response(grant.scopes);
 }
 
 async function rotateRefreshToken(clientId: string, body: URLSearchParams) {
   const refreshToken = body.get("refresh_token");
   if (!refreshToken) throw new OAuthError("invalid_request", "refresh_token is required");
+  const parts = refreshToken.match(REFRESH_TOKEN);
+  if (!parts || !sameHash(refreshSignature(parts[1], parts[2]), parts[3])) throw new OAuthError("invalid_grant", "Invalid refresh token");
+  const grant = await prisma.oAuthGrant.findUnique({ where: { id: parts[1] } });
+  if (!grant || grant.clientId !== clientId || grant.revokedAt) throw new OAuthError("invalid_grant", "Invalid refresh token");
   const hash = sha256(refreshToken);
-  const grant = await prisma.oAuthGrant.findUnique({ where: { refreshTokenHash: hash } });
-  if (!grant) {
-    const reused = await prisma.oAuthGrant.findUnique({ where: { previousRefreshHash: hash } });
-    const recentRotation = reused?.refreshRotatedAt && Date.now() - reused.refreshRotatedAt.getTime() < REFRESH_REUSE_GRACE_MS;
-    if (reused && reused.clientId === clientId && !recentRotation) await revokeGrant(reused.id);
+  if (grant.refreshTokenHash !== hash) {
+    // Issued for this grant but already rotated out: someone else holds a copy. Revoke,
+    // unless it is the same client refreshing twice moments after a rotation.
+    const recentRotation = grant.refreshRotatedAt && Date.now() - grant.refreshRotatedAt.getTime() < REFRESH_REUSE_GRACE_MS;
+    if (!recentRotation) await revokeGrant(grant.id);
     throw new OAuthError("invalid_grant", "Invalid refresh token");
   }
-  if (grant.clientId !== clientId || grant.revokedAt || !grant.refreshExpiresAt || grant.refreshExpiresAt <= new Date()) {
-    throw new OAuthError("invalid_grant", "Invalid refresh token");
-  }
+  if (!grant.refreshExpiresAt || grant.refreshExpiresAt <= new Date()) throw new OAuthError("invalid_grant", "Invalid refresh token");
   if (!(await isMember(grant.userId, grant.workspaceId))) {
     await revokeGrant(grant.id);
     throw new OAuthError("invalid_grant", "Access to this workspace was removed");
   }
-  const tokens = newTokens();
+  const tokens = newTokens(grant.id);
   const updated = await prisma.oAuthGrant.updateMany({
     where: { id: grant.id, refreshTokenHash: hash, revokedAt: null },
-    data: { ...tokens.data, previousRefreshHash: hash, refreshRotatedAt: new Date() },
+    data: { ...tokens.data, refreshRotatedAt: new Date() },
   });
   if (updated.count !== 1) throw new OAuthError("invalid_grant", "Invalid refresh token");
   return tokens.response(grant.scopes);

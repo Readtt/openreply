@@ -26,6 +26,7 @@ const tokenRequest = (values: Record<string, string>) => exchangeToken(new Reque
 describe.skipIf(!databaseUrl)("MCP OAuth on real PostgreSQL", () => {
   beforeAll(async () => {
     vi.stubEnv("NEXTAUTH_URL", base);
+    vi.stubEnv("NEXTAUTH_SECRET", "db-test-secret-for-refresh-token-macs");
     vi.stubEnv("REDIS_URL", "redis://localhost:6379");
     sql = new Client({ connectionString: databaseUrl });
     await sql.connect();
@@ -76,11 +77,17 @@ describe.skipIf(!databaseUrl)("MCP OAuth on real PostgreSQL", () => {
     const rotated = await tokenRequest({ grant_type: "refresh_token", refresh_token: issued.refresh_token, client_id: client.client_id });
     await expect(authenticateMcp(mcpRequest(issued.access_token))).rejects.toMatchObject({ status: 401 });
     expect(await authenticateMcp(mcpRequest(rotated.access_token))).toMatchObject({ workspaceId: "workspace" });
+    const latest = await tokenRequest({ grant_type: "refresh_token", refresh_token: rotated.refresh_token, client_id: client.client_id });
+    expect(await authenticateMcp(mcpRequest(latest.access_token))).toMatchObject({ workspaceId: "workspace" });
 
-    await expect(tokenRequest({ grant_type: "authorization_code", code, code_verifier: verifier, client_id: client.client_id }))
+    // The first refresh token, two rotations later and past the grace window, revokes the grant.
+    await state.db.oAuthGrant.update({ where: { id: row.id }, data: { refreshRotatedAt: new Date(Date.now() - 120_000) } });
+    await expect(tokenRequest({ grant_type: "refresh_token", refresh_token: issued.refresh_token, client_id: client.client_id }))
       .rejects.toMatchObject({ code: "invalid_grant" });
     expect((await state.db.oAuthGrant.findUniqueOrThrow({ where: { id: row.id } })).revokedAt).toBeInstanceOf(Date);
-    await expect(authenticateMcp(mcpRequest(rotated.access_token))).rejects.toMatchObject({ status: 401 });
+    await expect(authenticateMcp(mcpRequest(latest.access_token))).rejects.toMatchObject({ status: 401 });
+    await expect(tokenRequest({ grant_type: "authorization_code", code, code_verifier: verifier, client_id: client.client_id }))
+      .rejects.toMatchObject({ code: "invalid_grant" });
   });
 
   it("cuts access when membership ends and deletes grants with their user", async () => {

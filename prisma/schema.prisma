@@ -152,7 +152,6 @@ model OAuthGrant {
   accessExpiresAt     DateTime?
   refreshTokenHash    String?     @unique
   refreshExpiresAt    DateTime?
-  previousRefreshHash String?     @unique
   refreshRotatedAt    DateTime?
   lastUsedAt          DateTime?
   revokedAt           DateTime?

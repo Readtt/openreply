@@ -28,7 +28,6 @@ CREATE TABLE "OAuthGrant" (
     "accessExpiresAt" TIMESTAMP(3),
     "refreshTokenHash" TEXT,
     "refreshExpiresAt" TIMESTAMP(3),
-    "previousRefreshHash" TEXT,
     "refreshRotatedAt" TIMESTAMP(3),
     "lastUsedAt" TIMESTAMP(3),
     "revokedAt" TIMESTAMP(3),
@@ -45,9 +44,6 @@ CREATE UNIQUE INDEX "OAuthGrant_accessTokenHash_key" ON "OAuthGrant"("accessToke
 
 -- CreateIndex
 CREATE UNIQUE INDEX "OAuthGrant_refreshTokenHash_key" ON "OAuthGrant"("refreshTokenHash");
-
--- CreateIndex
-CREATE UNIQUE INDEX "OAuthGrant_previousRefreshHash_key" ON "OAuthGrant"("previousRefreshHash");
 
 -- CreateIndex
 CREATE INDEX "OAuthGrant_clientId_idx" ON "OAuthGrant"("clientId");
