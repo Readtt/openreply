@@ -1,18 +1,18 @@
 import { z } from "zod";
-import { authenticateService } from "@/lib/integrations/auth";
 import { apiError, ApiError, checkOrigin, readJson } from "@/lib/integrations/http";
 import { callTool, listTools } from "@/lib/integrations/mcp";
+import { authenticateMcp, withMcpChallenge } from "@/lib/integrations/oauth";
 
 const versions = ["2025-03-26", "2025-06-18", "2025-11-25"];
 const rpcSchema = z.object({ jsonrpc: z.literal("2.0"), id: z.union([z.string(), z.number()]).optional(), method: z.string(), params: z.unknown().optional() });
 export async function GET(request: Request) {
-  try { checkOrigin(request); await authenticateService(request); return new Response(null, { status: 405, headers: { Allow: "POST" } }); }
-  catch (error) { return apiError(error); }
+  try { checkOrigin(request); await authenticateMcp(request); return new Response(null, { status: 405, headers: { Allow: "POST" } }); }
+  catch (error) { return withMcpChallenge(request, apiError(error)); }
 }
 export async function POST(request: Request) {
   try {
     checkOrigin(request);
-    const context = await authenticateService(request);
+    const context = await authenticateMcp(request);
     const version = request.headers.get("mcp-protocol-version");
     if (version && !versions.includes(version)) throw new ApiError("Unsupported MCP protocol version");
     const accept = request.headers.get("accept") ?? "";
@@ -39,5 +39,5 @@ export async function POST(request: Request) {
       catch (error) { result = { isError: true, content: [{ type: "text", text: error instanceof ApiError ? error.message : "Internal tool error" }] }; }
     } else return Response.json({ jsonrpc: "2.0", id: rpc.id, error: { code: -32601, message: "Method not found" } });
     return Response.json({ jsonrpc: "2.0", id: rpc.id, result }, { headers: { "Cache-Control": "no-store" } });
-  } catch (error) { return apiError(error); }
+  } catch (error) { return withMcpChallenge(request, apiError(error)); }
 }

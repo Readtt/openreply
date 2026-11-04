@@ -7,6 +7,11 @@ export async function readJson(request: Request, maxBytes = 64 * 1024): Promise<
   if (!request.headers.get("content-type")?.includes("application/json")) {
     throw new ApiError("application/json required", 415);
   }
+  try { return JSON.parse(await readText(request, maxBytes)); }
+  catch (error) { throw error instanceof ApiError ? error : new ApiError("Invalid JSON"); }
+}
+
+export async function readText(request: Request, maxBytes = 64 * 1024): Promise<string> {
   const reader = request.body?.getReader();
   if (!reader) throw new ApiError("Empty body");
   const chunks: Uint8Array[] = [];
@@ -23,8 +28,7 @@ export async function readJson(request: Request, maxBytes = 64 * 1024): Promise<
   const bytes = new Uint8Array(size);
   let offset = 0;
   for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length; }
-  try { return JSON.parse(new TextDecoder().decode(bytes)); }
-  catch { throw new ApiError("Invalid JSON"); }
+  return new TextDecoder().decode(bytes);
 }
 
 export function checkOrigin(request: Request) {
@@ -32,6 +36,19 @@ export function checkOrigin(request: Request) {
   if (!origin) return;
   const expected = new URL(process.env.NEXTAUTH_URL ?? request.url).origin;
   if (origin !== expected) throw new ApiError("Origin not allowed", 403);
+}
+
+/**
+ * For browser form posts that act on the signed-in session: the Origin header must
+ * be present and be this site, as configured or as seen through a reverse proxy.
+ */
+export function requireSameOrigin(request: Request) {
+  const origin = request.headers.get("origin");
+  const allowed = [new URL(request.url).origin];
+  if (process.env.NEXTAUTH_URL) allowed.push(new URL(process.env.NEXTAUTH_URL).origin);
+  const forwardedHost = request.headers.get("x-forwarded-host");
+  if (forwardedHost) allowed.push(`${request.headers.get("x-forwarded-proto") ?? "https"}://${forwardedHost}`);
+  if (!origin || !allowed.includes(origin)) throw new ApiError("Origin not allowed", 403);
 }
 
 export function apiError(error: unknown) {

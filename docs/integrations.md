@@ -15,23 +15,63 @@ npm run db:migrate
 npm run db:generate
 ```
 
-The additive migration only creates `ServiceKey`; it does not change campaigns,
-authentication providers or worker behavior. `REDIS_URL` is required for service
-requests. Each key allows 120 requests per fixed 60-second window. Redis failures
-reject requests with 503 instead of disabling the limiter.
+The additive migrations only create `ServiceKey`, `OAuthClient` and `OAuthGrant`;
+they do not change campaigns, authentication providers or worker behavior.
+`REDIS_URL` is required for service requests. Each key or connected app allows
+120 requests per fixed 60-second window. Redis failures reject requests with 503
+instead of disabling the limiter.
 
-## MCP clients
+## Connect with your OpenReply account (OAuth)
 
-Connect to `https://YOUR-DOMAIN/api/mcp` using Streamable HTTP and a custom header:
+Clients that support MCP authorization (Claude, ChatGPT, Claude Code, Cursor,
+VS Code, MCP Inspector) need only the server URL:
+
+```text
+https://YOUR-DOMAIN/api/mcp
+```
+
+- **Claude / ChatGPT:** add a custom connector with that URL.
+- **Claude Code:** `claude mcp add --transport http openreply https://YOUR-DOMAIN/api/mcp`,
+  then run `/mcp` and choose **Authenticate**.
+
+The client is challenged with `401` and `WWW-Authenticate: Bearer resource_metadata=...`,
+reads `/.well-known/oauth-protected-resource/api/mcp` and
+`/.well-known/oauth-authorization-server`, registers itself at
+`/api/oauth/register` (RFC 7591) and opens `/oauth/authorize`. You sign in with
+your usual magic link and approve read-only access. The consent screen shows the
+app's self-declared name and the address you will be sent back to; approve only
+apps you started connecting yourself.
+
+- Any workspace member can connect. The grant is `campaigns:read` only, whatever
+  the client asks for, and is bound to that user and their workspace: it stops
+  working as soon as the user leaves the workspace.
+- See and disconnect apps under **API & MCP → Connected apps**. Members see
+  their own connections; owners and admins see and can disconnect everyone's.
+- PKCE (`S256`) is required. Access tokens last one hour; refresh tokens last
+  30 days and rotate on every use. Replaying a used code, or an old refresh
+  token, revokes the connection. Only SHA-256 hashes of codes, tokens and client
+  secrets are stored.
+- Redirect URIs must be HTTPS, loopback HTTP (any port, RFC 8252) or a native
+  app's private scheme. Registration is limited to 20 per hour per IP address.
+- A malformed authorization request shows an error page instead of redirecting,
+  so `/oauth/authorize` cannot be used as an open redirect. The only redirects
+  follow the user's own **Allow** or **Cancel**.
+- `NEXTAUTH_URL` must be your public HTTPS origin: it is the OAuth issuer and
+  the token audience, so changing it requires reconnecting clients.
+
+OAuth tokens are accepted only by `/api/mcp`. The REST API keeps using service keys.
+
+## MCP clients with a service key
+
+Clients without OAuth support can connect to `https://YOUR-DOMAIN/api/mcp`
+using Streamable HTTP and a custom header:
 
 ```text
 Authorization: Bearer <service-key>
 ```
 
-There is no OAuth server, dynamic client registration or token in the URL.
-In Claude, use **No authentication** plus this custom request header **only if
-your client offers request headers**. Clients requiring OAuth are not supported.
-Never switch to public access to work around a client limitation.
+Never put the key in the URL, and never switch to public access to work around a
+client limitation.
 
 Tools (all read-only; scope `campaigns:read`):
 

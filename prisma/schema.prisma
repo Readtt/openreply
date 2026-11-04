@@ -23,6 +23,7 @@ model User {
   ownedWorkspaces   Workspace[]       @relation("WorkspaceOwner")
   workspaceMembers  WorkspaceMember[]
   sentInvitations   WorkspaceInvitation[] @relation("WorkspaceInvitationsSent")
+  oauthGrants       OAuthGrant[]
 }
 
 model Account {
@@ -86,6 +87,7 @@ model Workspace {
   webhookEvents     WebhookEvent[]
   operationalEvents OperationalEvent[]
   serviceKeys       ServiceKey[]
+  oauthGrants       OAuthGrant[]
 
   @@index([ownerId])
 }
@@ -116,6 +118,50 @@ model ServiceKey {
   lastUsedAt  DateTime?
   workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
 
+  @@index([workspaceId])
+}
+
+/// An MCP client that registered itself through OAuth dynamic client registration.
+/// The id is the public client_id. Confidential clients also get a secret, stored hashed.
+model OAuthClient {
+  id           String       @id
+  name         String
+  redirectUris String[]
+  authMethod   String       @default("none")
+  secretHash   String?
+  createdAt    DateTime     @default(now())
+  grants       OAuthGrant[]
+}
+
+/// One user's consent for one client to read one workspace. It holds the single-use
+/// authorization code and, once exchanged, the current access/refresh token pair
+/// (rotated on every refresh). Only SHA-256 hashes of codes and tokens are stored.
+model OAuthGrant {
+  id                  String      @id @default(cuid())
+  clientId            String
+  userId              String
+  workspaceId         String
+  scopes              String[]
+  resource            String
+  redirectUri         String
+  codeHash            String      @unique
+  codeChallenge       String
+  codeExpiresAt       DateTime
+  codeUsedAt          DateTime?
+  accessTokenHash     String?     @unique
+  accessExpiresAt     DateTime?
+  refreshTokenHash    String?     @unique
+  refreshExpiresAt    DateTime?
+  refreshRotatedAt    DateTime?
+  lastUsedAt          DateTime?
+  revokedAt           DateTime?
+  createdAt           DateTime    @default(now())
+  client              OAuthClient @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  user                User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  workspace           Workspace   @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@index([clientId])
+  @@index([userId])
   @@index([workspaceId])
 }
 
