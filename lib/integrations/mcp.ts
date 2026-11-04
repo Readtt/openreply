@@ -305,8 +305,13 @@ const tools: Tool[] = [
     description: "The Diagnostics page: DM queue counts, worker health and alerts, and recent webhook failures, failed DMs, token refresh failures and operational events. Use it to explain why DMs are not going out.",
     run: async context => {
       const { GET } = await import("@/app/api/admin/diagnostics/route");
-      const data = await callDashboard<Record<string, unknown> & { tokenRefreshFailures?: Record<string, unknown>[] }>(context, GET);
-      return { ...data, tokenRefreshFailures: (data.tokenRefreshFailures ?? []).map(({ payload, ...failure }) => (void payload, failure)) };
+      type Rows = Record<string, unknown>[] | undefined;
+      const data = await callDashboard<Record<string, unknown> & { dmFailures?: Rows; tokenRefreshFailures?: Rows }>(context, GET);
+      return {
+        ...data,
+        dmFailures: (data.dmFailures ?? []).map(({ commentId, ...failure }) => (void commentId, failure)),
+        tokenRefreshFailures: (data.tokenRefreshFailures ?? []).map(({ payload, ...failure }) => (void payload, failure)),
+      };
     },
   },
 ];

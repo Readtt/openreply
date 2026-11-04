@@ -167,8 +167,12 @@ describe("outputs", () => {
     expect(JSON.stringify(members)).not.toContain("secret-token");
     expect(members).toMatchObject({ yourRole: "MEMBER", pendingInvitations: [{ email: "new@example.test", role: "ADMIN" }] });
 
-    state.routes.diagnostics.GET.mockResolvedValue(state.ok({ queueCounts: { failed: 1 }, tokenRefreshFailures: [{ id: "t", message: "expired", payload: { token: "raw" } }] }));
+    state.routes.diagnostics.GET.mockResolvedValue(state.ok({ queueCounts: { failed: 1 },
+      dmFailures: [{ id: "d", status: "FAILED", commentId: "ig-comment-2", commentText: "LINK", errorMessage: "window closed", automation: { name: "Guide" } }],
+      tokenRefreshFailures: [{ id: "t", message: "expired", payload: { token: "raw" } }] }));
     const diagnostics = await callTool(user(), "get_diagnostics", {});
-    expect(diagnostics).toEqual({ queueCounts: { failed: 1 }, tokenRefreshFailures: [{ id: "t", message: "expired" }] });
+    expect(diagnostics).toEqual({ queueCounts: { failed: 1 },
+      dmFailures: [{ id: "d", status: "FAILED", commentText: "LINK", errorMessage: "window closed", automation: { name: "Guide" } }],
+      tokenRefreshFailures: [{ id: "t", message: "expired" }] });
   });
 });
